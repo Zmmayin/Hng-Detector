@@ -1,0 +1,71 @@
+volumes:
+  HNG-nginx-logs:
+  nextcloud-data:
+  db-data:
+
+networks:
+  hng-network:
+
+services:
+  db:
+    image: mariadb:10.11
+    container_name: db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: nextcloudpassword
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - hng-network
+
+  nextcloud:
+    image: kefaslungu/hng-nextcloud
+    container_name: nextcloud
+    restart: unless-stopped
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: nextcloudpassword
+    volumes:
+      - nextcloud-data:/var/www/html
+      - HNG-nginx-logs:/var/log/nginx:ro
+    depends_on:
+      - db
+    networks:
+      - hng-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - HNG-nginx-logs:/var/log/nginx
+    depends_on:
+      - nextcloud
+    networks:
+      - hng-network
+
+  detector:
+    environment:
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL} 
+    build:
+      context: ./detector
+      dockerfile: Dockerfile
+    container_name: detector
+    restart: unless-stopped
+    user: root
+    volumes:
+      - HNG-nginx-logs:/var/log/nginx:ro
+      - ./logs:/var/log/detector
+    networks:
+      - hng-network
+    cap_add:
+      - NET_ADMIN
