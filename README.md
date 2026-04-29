@@ -150,10 +150,10 @@ The baseline learns what normal traffic looks like using a rolling 30-minute win
 
 ## GitHub Repository
 
-https://github.com/Zmmayin/Hng-Detector
+[Hng-Detector](https://github.com/Zmmayin/Hng-Detector)
 
 ---
 
 ## Blog Post
 
-YOUR_BLOG_POST_URL
+[How I Built a Real-Time DDoS Detection Engine from Scratch](https://medium.com/@eifelowo/how-i-built-a-real-time-ddos-detection-engine-from-scratch-6083ed94aece)
