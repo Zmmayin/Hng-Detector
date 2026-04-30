@@ -16,15 +16,13 @@ class Detector:
         self.error_rate_multiplier = config.get("error_rate_multiplier", 3.0)
         self.baseline = baseline
 
-        # Per-IP sliding windows
-        # {ip: deque of timestamps}
+        # Per-IP sliding windows — one per IP as required
         self.ip_windows = defaultdict(deque)
 
         # Per-IP error sliding windows
-        # {ip: deque of timestamps}
         self.ip_error_windows = defaultdict(deque)
 
-        # Global sliding window
+        # Global sliding window — one global as required
         self.global_window = deque()
 
     def record_request(self, log_entry):
@@ -36,17 +34,12 @@ class Detector:
         status = log_entry["status"]
         now = time.time()
 
-        # Add to per-IP window
         self.ip_windows[ip].append(now)
-
-        # Add to global window
         self.global_window.append(now)
 
-        # Track errors (4xx/5xx)
         if status >= 400:
             self.ip_error_windows[ip].append(now)
 
-        # Evict old timestamps
         self._evict(self.ip_windows[ip], now)
         self._evict(self.global_window, now)
         self._evict(self.ip_error_windows[ip], now)
@@ -60,6 +53,19 @@ class Detector:
         while window and window[0] < cutoff:
             window.popleft()
 
+    def clear_ip(self, ip):
+        """
+        Clear all sliding window data for a banned IP immediately.
+        Prevents attack traffic from inflating baseline calculations
+        after the IP is banned.
+        """
+        count = len(self.ip_windows.get(ip, []))
+        if ip in self.ip_windows:
+            self.ip_windows[ip].clear()
+        if ip in self.ip_error_windows:
+            self.ip_error_windows[ip].clear()
+        print(f"[detector] Cleared {count} attack timestamps for {ip}")
+
     def get_ip_rate(self, ip):
         """
         Get current request rate for an IP in requests/second.
@@ -71,10 +77,15 @@ class Detector:
     def get_global_rate(self):
         """
         Get current global request rate in requests/second.
+        Rebuilt from individual IP windows so cleared banned IPs
+        do not inflate the global rate.
         """
         now = time.time()
-        self._evict(self.global_window, now)
-        return len(self.global_window) / self.window_seconds
+        total = 0
+        for ip, window in self.ip_windows.items():
+            self._evict(window, now)
+            total += len(window)
+        return total / self.window_seconds
 
     def get_ip_error_rate(self, ip):
         """
@@ -93,8 +104,6 @@ class Detector:
         for ip in self.ip_windows:
             self._evict(self.ip_windows[ip], now)
             rates[ip] = len(self.ip_windows[ip]) / self.window_seconds
-
-        # Sort by rate descending
         return sorted(rates.items(), key=lambda x: x[1], reverse=True)[:n]
 
     def check_ip(self, ip, banned_ips):
@@ -109,7 +118,6 @@ class Detector:
         rate = self.get_ip_rate(ip)
         error_rate = self.get_ip_error_rate(ip)
 
-        # Tighten thresholds if error surge detected
         if self.baseline.is_error_surge(error_rate, self.error_rate_multiplier):
             zscore_threshold = self.zscore_threshold * 0.5
             rate_multiplier = self.rate_multiplier * 0.5
@@ -120,7 +128,6 @@ class Detector:
         anomalous, reason = self.baseline.is_anomalous(
             rate, zscore_threshold, rate_multiplier
         )
-
         return anomalous, reason, rate
 
     def check_global(self):
@@ -129,9 +136,7 @@ class Detector:
         Returns (is_anomalous, reason, rate) tuple.
         """
         rate = self.get_global_rate()
-
         anomalous, reason = self.baseline.is_anomalous(
             rate, self.zscore_threshold, self.rate_multiplier
         )
-
         return anomalous, reason, rate

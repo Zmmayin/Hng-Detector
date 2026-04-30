@@ -19,9 +19,6 @@ def load_config(path="config.yaml"):
 
 
 def setup_audit_log(log_path):
-    """
-    Create audit log directory and return a logging function.
-    """
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
     def audit_log(action, ip, condition, rate, baseline, duration):
@@ -45,22 +42,41 @@ def setup_audit_log(log_path):
 
 def run_baseline_recorder(baseline, detector, interval=1.0):
     """
-    Every second, count requests in the sliding window
-    and feed the count to the baseline.
-    Runs in a background thread.
+    Every second, count requests that arrived in the last
+    1 second only — giving a true per-second count.
+    This satisfies the requirement:
+    'rolling 30-minute window of per-second counts'
+    Attack traffic from banned IPs is naturally excluded
+    because their windows are cleared on ban.
     """
     while True:
         try:
-            global_rate = detector.get_global_rate()
-            # Count errors across all IPs
-            error_count = sum(
-                len(detector.ip_error_windows[ip])
-                for ip in detector.ip_error_windows
-            )
+            now = time.time()
+            one_second_ago = now - 1.0
+
+            # Count requests in last 1 second from all IPs
+            per_second_count = 0
+            per_second_errors = 0
+
+            for ip, window in detector.ip_windows.items():
+                for ts in reversed(window):
+                    if ts >= one_second_ago:
+                        per_second_count += 1
+                    else:
+                        break  # deque is ordered, stop early
+
+            for ip, window in detector.ip_error_windows.items():
+                for ts in reversed(window):
+                    if ts >= one_second_ago:
+                        per_second_errors += 1
+                    else:
+                        break
+
             baseline.record(
-                count=int(global_rate * detector.window_seconds),
-                error_count=error_count,
+                count=per_second_count,
+                error_count=per_second_errors,
             )
+
         except Exception as e:
             print(f"[baseline-recorder] Error: {e}")
         time.sleep(interval)
@@ -69,13 +85,9 @@ def run_baseline_recorder(baseline, detector, interval=1.0):
 def main():
     print("[main] Starting HNG Anomaly Detection Engine...")
 
-    # Load config
     config = load_config("config.yaml")
-
-    # Setup audit log
     audit_log = setup_audit_log(config["audit_log_path"])
 
-    # Initialize components
     notifier = Notifier(config)
     baseline = Baseline(config)
     baseline.audit_log = audit_log
@@ -86,17 +98,15 @@ def main():
     unbanner = Unbanner(blocker, notifier)
     dashboard = Dashboard(config, detector, blocker, baseline)
 
-    # Track recently alerted IPs to avoid duplicate alerts
-    # {ip: last_alert_time}
     alerted_ips = {}
     global_alerted_at = 0
-    alert_cooldown = 60  # seconds between alerts for same IP
+    alert_cooldown = 60
 
-    # Start background services
     unbanner.start()
     dashboard.start()
 
-    # Start baseline recorder in background thread
+    # Note: no blocker passed — attack traffic excluded
+    # naturally via clear_ip() after each ban
     baseline_thread = threading.Thread(
         target=run_baseline_recorder,
         args=(baseline, detector),
@@ -107,21 +117,16 @@ def main():
 
     print("[main] All services started — tailing logs...")
 
-    # Main loop — process log entries one by one
     for entry in tail_log(config["log_path"]):
         try:
             ip = entry["source_ip"]
+            now = time.time()
 
-            # Record request in detector sliding windows
             detector.record_request(entry)
 
-            # Skip banned IPs
             if blocker.is_banned(ip):
                 continue
 
-            now = time.time()
-
-            # Check per-IP anomaly
             is_anomalous, reason, rate = detector.check_ip(
                 ip, blocker.get_banned_ips()
             )
@@ -130,21 +135,20 @@ def main():
                 last_alerted = alerted_ips.get(ip, 0)
                 if now - last_alerted > alert_cooldown:
                     alerted_ips[ip] = now
-
                     print(
                         f"[main] ANOMALY DETECTED — IP={ip} "
                         f"rate={rate:.2f} reason={reason}"
                     )
-
-                    # Ban the IP
                     blocker.ban(
                         ip=ip,
                         reason=reason,
                         rate=rate,
                         baseline_mean=baseline.effective_mean,
                     )
+                    # Clear attack traffic immediately
+                    # so baseline stays clean for next attack
+                    detector.clear_ip(ip)
 
-                    # Send Slack alert
                     ban_info = blocker.get_banned_ips().get(ip, {})
                     notifier.send_ban_alert(
                         ip=ip,
@@ -154,7 +158,6 @@ def main():
                         duration=ban_info.get("duration", -1),
                     )
 
-            # Check global anomaly every 5 seconds
             if not hasattr(main, "_last_global_check"):
                 main._last_global_check = 0
 
